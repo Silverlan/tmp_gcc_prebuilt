@@ -46,19 +46,11 @@ jobs:
           # Make sure tags are available for version detection
           git fetch --tags --prune || true
 
-          if [ -n "${{ github.event.inputs.git_sha }}" ]; then
-            echo "Using provided ref: ${{ github.event.inputs.git_sha }}"
-            # Try fetch + checkout the provided ref (branch, tag or commit)
-            git fetch --depth=1 origin "${{ github.event.inputs.git_sha }}" || true
-            if git rev-parse --verify --quiet "${{ github.event.inputs.git_sha }}" >/dev/null; then
-              git checkout --detach "${{ github.event.inputs.git_sha }}"
-            else
-              exit 1
-            fi
-          else
-            # No ref provided: stay on default branch (repo default), update to latest
-            git checkout master 2>/dev/null || git checkout main 2>/dev/null || true
-            git pull --ff-only 2>/dev/null || true
+          ref="${{ github.event.inputs.git_sha }}"
+          if [ -n "${ref}" ]; then
+            echo "Using provided ref: ${ref}"
+            git fetch --depth=1 origin "${ref}" || { echo "git fetch failed"; exit 1; }
+            git checkout --detach FETCH_HEAD || { echo "checkout FETCH_HEAD failed"; exit 1; }
           fi
 
           # Prepare binutils alongside gcc (same as before)
