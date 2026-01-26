@@ -1,11 +1,12 @@
 name: Build GCC
+
 on:
   workflow_dispatch:
     inputs:
-      gcc_sha:
-        description: 'Git SHA to build (leave empty for master/latest)'
+      git_sha:
+        description: 'Optional git SHA, branch, or tag to build (leave empty to build latest/default branch)'
         required: false
-        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -21,10 +22,8 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
-      - name: Checkout
+      - name: Checkout (workflow repo)
         uses: actions/checkout@v4
-
-      # See https://github.com/mattkretz/cplusplus-ci/blob/main/Dockerfile.gcc16 for implementation
 
       - name: Install build dependencies
         run: |
@@ -36,33 +35,47 @@ jobs:
           sudo apt-get clean
 
       - name: Fetch sources
-        env:
-          INPUT_SHA: ${{ inputs.gcc_sha }}
+        # clones the gcc source; if a git_sha input was provided, attempt to check it out
         run: |
-          # Determine which ref to download (Input SHA or master)
-          if [ -n "$INPUT_SHA" ]; then
-            GCC_REF="$INPUT_SHA"
-            echo "Building specific commit: $GCC_REF"
+          set -euo pipefail
+          mkdir -p $HOME/gcc-16
+          # Clone (full clone to allow tags/describes). If runner disk constraints are an issue,
+          # switch to a shallow clone and fetch additional refs as needed.
+          git clone https://github.com/gcc-mirror/gcc.git $HOME/gcc-16
+          cd $HOME/gcc-16
+          # Make sure tags are available for version detection
+          git fetch --tags --prune || true
+
+          if [ -n "${{ github.event.inputs.git_sha }}" ]; then
+            echo "Using provided ref: ${{ github.event.inputs.git_sha }}"
+            # Try fetch + checkout the provided ref (branch, tag or commit)
+            git fetch --depth=1 origin "${{ github.event.inputs.git_sha }}" || true
+            if git rev-parse --verify --quiet "${{ github.event.inputs.git_sha }}" >/dev/null; then
+              git checkout --detach "${{ github.event.inputs.git_sha }}"
+            else
+              # as fallback, try to checkout FETCH_HEAD if fetch succeeded
+              if [ -f .git/FETCH_HEAD ]; then
+                git checkout --detach FETCH_HEAD || true
+              fi
+            fi
           else
-            GCC_REF="master"
-            echo "Building latest master"
+            # No ref provided: stay on default branch (repo default), update to latest
+            git checkout master 2>/dev/null || git checkout main 2>/dev/null || true
+            git pull --ff-only 2>/dev/null || true
           fi
 
-          mkdir -p $HOME/gcc-16/obj
-          
-          # Download dynamic ref
-          curl -L "https://github.com/gcc-mirror/gcc/archive/${GCC_REF}.tar.gz" | tar -xz --strip-components=1 -C $HOME/gcc-16
-          
+          # Prepare binutils alongside gcc (same as before)
           mkdir -p $HOME/binutils
           curl -L https://sourceware.org/pub/binutils/releases/binutils-2.45.tar.gz | tar -xz --strip-components=1 -C $HOME/binutils
-          
           cd $HOME/gcc-16
           ln -s ../binutils/bfd ../binutils/gas ../binutils/binutils ../binutils/ld ../binutils/libctf \
-             ../binutils/libsframe ../binutils/opcodes .
+             ../binutils/libsframe ../binutils/opcodes . || true
 
       - name: Configure
         run: |
-          cd $HOME/gcc-16/obj
+          cd $HOME/gcc-16
+          mkdir -p obj
+          cd obj
           ../configure --enable-languages=c,c++,lto --prefix=/opt/gcc-16 --enable-checking=release --disable-bootstrap --disable-multilib
 
       - name: Build and install
@@ -81,47 +94,73 @@ jobs:
           sudo tar -C /opt -cJf /tmp/gcc-16-opt.tar.xz gcc-16
           ls -lh /tmp/gcc-16-opt.tar.xz
 
-      # Release Steps
-      
-      - name: Generate Release Info (Date & Version)
-        id: get_info
+      # Determine GCC version (used in tag/release names)
+      - name: Determine GCC version and build tag
+        id: get_version
         shell: bash
         run: |
-          # Extract GCC version from the source code (typically found in gcc/BASE-VER)
-          GCC_VER=$(cat $HOME/gcc-16/gcc/BASE-VER)
-          CURRENT_DATE=$(TZ='Europe/Berlin' date +%F)
-          
-          # Construct a tag name: gcc-<ver>-<date>
-          TAG_NAME="gcc-${GCC_VER}-${CURRENT_DATE}"
-          
-          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
-          echo "gcc_ver=${GCC_VER}" >> $GITHUB_OUTPUT
-          
-          printf "Pre-built binaries for GCC version %s (Built on %s)." "$GCC_VER" "$CURRENT_DATE" > tag_text.txt
+          set -euo pipefail
+          cd $HOME/gcc-16
 
+          # Ensure we have tags available
+          git fetch --tags --prune || true
+
+          # Try to resolve a human-friendly version:
+          # 1) nearest annotated tag (if present)
+          # 2) otherwise the most recent tag
+          # 3) otherwise fallback to short commit
+          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            v="$(git describe --tags --abbrev=0)"
+          else
+            # try a broader describe
+            v="$(git describe --tags --always --long 2>/dev/null || true)"
+            if [ -z "$v" ]; then
+              v="commit-$(git rev-parse --short HEAD)"
+            fi
+          fi
+
+          # sanitize slashes (tags like releases/gcc-16.1.0) for safe use in tag names
+          v="${v//\//-}"
+          date="$(TZ='Europe/Berlin' date +%F)"
+
+          # build_tag example: gcc-16.1.0-2026-01-26 or commit-abc123-2026-01-26
+          build_tag="${v}-${date}"
+
+          echo "gcc_version=$v" >> $GITHUB_OUTPUT
+          echo "date=$date" >> $GITHUB_OUTPUT
+          echo "build_tag=$build_tag" >> $GITHUB_OUTPUT
+
+      - name: Generate nightly tag description
+        shell: bash
+        run: |
+          printf "Pre-built binaries for GCC %s.\n\nBuilt on: %s\n" "${{ steps.get_version.outputs.gcc_version }}" "${{ steps.get_version.outputs.date }}" > tag_text.txt
+          cat tag_text.txt
+
+      # Checkout the repository where you want to create the tag (as original workflow did)
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           path: "repo"
-          
+
       - name: Create Tag
         uses: Silverlan/common_actions/create_tag@main
         with:
-          tag_name: "${{ steps.get_info.outputs.tag_name }}"
+          tag_name: "${{ steps.get_version.outputs.build_tag }}"
           path: "repo"
 
-      - name: Update nightly tag description
+      - name: Create/Update GitHub Release (tag+name include GCC version)
         uses: softprops/action-gh-release@v0.1.15
         with:
           body_path: tag_text.txt
-          tag_name: "${{ steps.get_info.outputs.tag_name }}"
+          tag_name: "${{ steps.get_version.outputs.build_tag }}"
           target_commitish: ${{ github.sha }}
           prerelease: true
+          # set release name to include the GCC version and date
+          name: "Nightly build - GCC ${{ steps.get_version.outputs.gcc_version }} (${ { steps.get_version.outputs.date } })"
 
-      - name: Update nightly release
+      - name: Update nightly release (upload artifact)
         uses: pyTooling/Actions/releaser/composite@v4.2.2
         with:
-          tag: "${{ steps.get_info.outputs.tag_name }}"
+          tag: "${{ steps.get_version.outputs.build_tag }}"
           token: ${{ secrets.GITHUB_TOKEN }}
           files: "/tmp/gcc-16-opt.tar.xz"
-          
