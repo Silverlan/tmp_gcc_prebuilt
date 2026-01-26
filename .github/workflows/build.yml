@@ -1,0 +1,127 @@
+name: Build GCC
+on:
+  workflow_dispatch:
+    inputs:
+      gcc_sha:
+        description: 'Git SHA to build (leave empty for master/latest)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      issues: read
+      pull-requests: read
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # See https://github.com/mattkretz/cplusplus-ci/blob/main/Dockerfile.gcc16 for implementation
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf2.69 dwz lzma xz-utils libzstd-dev zlib1g-dev systemtap-sdt-dev \
+            binutils gettext nvptx-tools amdgcn-tools-18 \
+            texinfo sharutils procps netbase libisl-dev libmpc-dev libmpfr-dev libgmp-dev lib32z1-dev libx32z1-dev
+          sudo apt-get clean
+
+      - name: Fetch sources
+        env:
+          INPUT_SHA: ${{ inputs.gcc_sha }}
+        run: |
+          # Determine which ref to download (Input SHA or master)
+          if [ -n "$INPUT_SHA" ]; then
+            GCC_REF="$INPUT_SHA"
+            echo "Building specific commit: $GCC_REF"
+          else
+            GCC_REF="master"
+            echo "Building latest master"
+          fi
+
+          mkdir -p $HOME/gcc-16/obj
+          
+          # Download dynamic ref
+          curl -L "https://github.com/gcc-mirror/gcc/archive/${GCC_REF}.tar.gz" | tar -xz --strip-components=1 -C $HOME/gcc-16
+          
+          mkdir -p $HOME/binutils
+          curl -L https://sourceware.org/pub/binutils/releases/binutils-2.45.tar.gz | tar -xz --strip-components=1 -C $HOME/binutils
+          
+          cd $HOME/gcc-16
+          ln -s ../binutils/bfd ../binutils/gas ../binutils/binutils ../binutils/ld ../binutils/libctf \
+             ../binutils/libsframe ../binutils/opcodes .
+
+      - name: Configure
+        run: |
+          cd $HOME/gcc-16/obj
+          ../configure --enable-languages=c,c++,lto --prefix=/opt/gcc-16 --enable-checking=release --disable-bootstrap --disable-multilib
+
+      - name: Build and install
+        run: |
+          cd $HOME/gcc-16/obj
+          make BOOT_CFLAGS=-march=x86-64-v3 -j$(nproc || 3)
+          sudo make -j$(nproc || 3) install-strip
+
+      - name: Register alternatives
+        run: |
+          sudo update-alternatives --install /usr/bin/gcc-16 gcc-16 /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++-16 g++-16 /opt/gcc-16/bin/g++
+          sudo update-alternatives --install /usr/bin/gcc gcc /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++ g++ /opt/gcc-16/bin/g++
+
+      - name: Create tarball of /opt/gcc-16
+        run: |
+          sudo tar -C /opt -cJf /tmp/gcc-16-opt.tar.xz gcc-16
+          ls -lh /tmp/gcc-16-opt.tar.xz
+
+      # Release Steps
+      
+      - name: Generate Release Info (Date & Version)
+        id: get_info
+        shell: bash
+        run: |
+          # Extract GCC version from the source code (typically found in gcc/BASE-VER)
+          GCC_VER=$(cat $HOME/gcc-16/gcc/BASE-VER)
+          CURRENT_DATE=$(TZ='Europe/Berlin' date +%F)
+          
+          # Construct a tag name: gcc-<ver>-<date>
+          TAG_NAME="gcc-${GCC_VER}-${CURRENT_DATE}"
+          
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "gcc_ver=${GCC_VER}" >> $GITHUB_OUTPUT
+          
+          printf "Pre-built binaries for GCC version %s (Built on %s)." "$GCC_VER" "$CURRENT_DATE" > tag_text.txt
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: "repo"
+          
+      - name: Create Tag
+        uses: Silverlan/common_actions/create_tag@main
+        with:
+          tag_name: "${{ steps.get_info.outputs.tag_name }}"
+          path: "repo"
+
+      - name: Update nightly tag description
+        uses: softprops/action-gh-release@v0.1.15
+        with:
+          body_path: tag_text.txt
+          tag_name: "${{ steps.get_info.outputs.tag_name }}"
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+
+      - name: Update nightly release
+        uses: pyTooling/Actions/releaser/composite@v4.2.2
+        with:
+          tag: "${{ steps.get_info.outputs.tag_name }}"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: "/tmp/gcc-16-opt.tar.xz"
+          
