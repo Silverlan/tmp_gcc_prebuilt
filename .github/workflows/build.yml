@@ -53,10 +53,7 @@ jobs:
             if git rev-parse --verify --quiet "${{ github.event.inputs.git_sha }}" >/dev/null; then
               git checkout --detach "${{ github.event.inputs.git_sha }}"
             else
-              # as fallback, try to checkout FETCH_HEAD if fetch succeeded
-              if [ -f .git/FETCH_HEAD ]; then
-                git checkout --detach FETCH_HEAD || true
-              fi
+              exit 1
             fi
           else
             # No ref provided: stay on default branch (repo default), update to latest
