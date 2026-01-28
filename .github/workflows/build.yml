@@ -164,7 +164,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           prerelease: true
           # set release name to include the GCC version and git ref (no date)
-          name: "Nightly build - GCC ${{ steps.get_version.outputs.gcc_version }} (${ { steps.get_version.outputs.git_ref } })"
+          name: "Nightly build - GCC ${{ steps.get_version.outputs.gcc_version }} (${{ steps.get_version.outputs.git_ref }})"
 
       - name: Update nightly release (upload artifact)
         uses: pyTooling/Actions/releaser/composite@v4.2.2
