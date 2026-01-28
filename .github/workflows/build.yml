@@ -38,11 +38,11 @@ jobs:
         # clones the gcc source; if a git_sha input was provided, attempt to check it out
         run: |
           set -euo pipefail
-          mkdir -p $HOME/gcc-16
+          mkdir -p $HOME/gcc
           # Clone (full clone to allow tags/describes). If runner disk constraints are an issue,
           # switch to a shallow clone and fetch additional refs as needed.
-          git clone https://github.com/gcc-mirror/gcc.git $HOME/gcc-16
-          cd $HOME/gcc-16
+          git clone https://github.com/gcc-mirror/gcc.git $HOME/gcc
+          cd $HOME/gcc
           # Make sure tags are available for version detection
           git fetch --tags --prune || true
 
@@ -56,40 +56,35 @@ jobs:
           # Prepare binutils alongside gcc (same as before)
           mkdir -p $HOME/binutils
           curl -L https://sourceware.org/pub/binutils/releases/binutils-2.45.tar.gz | tar -xz --strip-components=1 -C $HOME/binutils
-          cd $HOME/gcc-16
+          cd $HOME/gcc
           ln -s ../binutils/bfd ../binutils/gas ../binutils/binutils ../binutils/ld ../binutils/libctf \
              ../binutils/libsframe ../binutils/opcodes . || true
 
       - name: Configure
         run: |
-          cd $HOME/gcc-16
+          cd $HOME/gcc
           mkdir -p obj
           cd obj
-          ../configure --enable-languages=c,c++,lto --prefix=/opt/gcc-16 --enable-checking=release --disable-bootstrap --disable-multilib
+          ../configure --enable-languages=c,c++,lto --prefix=/opt/gcc --enable-checking=release --disable-bootstrap --disable-multilib
 
       - name: Build and install
         run: |
-          cd $HOME/gcc-16/obj
+          cd $HOME/gcc/obj
           make BOOT_CFLAGS=-march=x86-64-v3 -j$(nproc || 3)
           sudo make -j$(nproc || 3) install-strip
 
       - name: Register alternatives
         run: |
-          sudo update-alternatives --install /usr/bin/gcc-16 gcc-16 /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++-16 g++-16 /opt/gcc-16/bin/g++
-          sudo update-alternatives --install /usr/bin/gcc gcc /opt/gcc-16/bin/gcc 160 --slave /usr/bin/g++ g++ /opt/gcc-16/bin/g++
+          sudo update-alternatives --install /usr/bin/gcc gcc /opt/gcc/bin/gcc 160 --slave /usr/bin/g++ g++ /opt/gcc/bin/g++
+          # If you still want a versioned sibling like gcc-16, add another install here (optional)
 
-      - name: Create tarball of /opt/gcc-16
-        run: |
-          sudo tar -C /opt -cJf /tmp/gcc-16-opt.tar.xz gcc-16
-          ls -lh /tmp/gcc-16-opt.tar.xz
-
-      # Determine GCC version (used in tag/release names)
+      # Determine GCC version and build tag (now that /opt/gcc exists)
       - name: Determine GCC version and build tag
         id: get_version
         shell: bash
         run: |
           set -euo pipefail
-          cd $HOME/gcc-16
+          cd $HOME/gcc
 
           # Ensure we have tags available
           git fetch --tags --prune || true
@@ -101,29 +96,53 @@ jobs:
           if git describe --tags --abbrev=0 >/dev/null 2>&1; then
             v="$(git describe --tags --abbrev=0)"
           else
-            # try a broader describe
             v="$(git describe --tags --always --long 2>/dev/null || true)"
             if [ -z "$v" ]; then
               v="commit-$(git rev-parse --short HEAD)"
             fi
           fi
 
-          # sanitize slashes (tags like releases/gcc-16.1.0) for safe use in tag names
+          # Determine the git ref we built from (use input if provided; otherwise the short commit)
+          git_ref="${{ github.event.inputs.git_sha }}"
+          if [ -z "$git_ref" ]; then
+            git_ref="$(git rev-parse --short HEAD)"
+          fi
+
+          # sanitize slashes (tags like releases/gcc-16.1.0) for safe use in names
           v="${v//\//-}"
-          date="$(TZ='Europe/Berlin' date +%F)"
+          git_ref="${git_ref//\//-}"
 
-          # build_tag example: gcc-16.1.0-2026-01-26 or commit-abc123-2026-01-26
-          build_tag="${v}-${date}"
+          # get the actual installed gcc version (prefer -dumpfullversion, fallback to parsing --version)
+          if /opt/gcc/bin/gcc -dumpfullversion >/dev/null 2>&1; then
+            gcc_version="$(/opt/gcc/bin/gcc -dumpfullversion)"
+          else
+            gcc_version="$(/opt/gcc/bin/gcc --version | head -n1 | grep -oE '[0-9]+(\.[0-9]+){1,}' | head -n1 || true)"
+            if [ -z "$gcc_version" ]; then
+              gcc_version="unknown"
+            fi
+          fi
 
-          echo "gcc_version=$v" >> $GITHUB_OUTPUT
-          echo "date=$date" >> $GITHUB_OUTPUT
+          # build_tag example: gcc-16.1.0-<ref>  (no date)
+          build_tag="${v}-${git_ref}"
+
+          # archive name: include the actual gcc version and the git ref
+          archive_name="gcc-${gcc_version}-${git_ref}.tar.xz"
+
+          echo "gcc_version=$gcc_version" >> $GITHUB_OUTPUT
+          echo "git_ref=$git_ref" >> $GITHUB_OUTPUT
           echo "build_tag=$build_tag" >> $GITHUB_OUTPUT
+          echo "archive_name=$archive_name" >> $GITHUB_OUTPUT
 
       - name: Generate nightly tag description
         shell: bash
         run: |
-          printf "Pre-built binaries for GCC %s.\n\nBuilt on: %s\n" "${{ steps.get_version.outputs.gcc_version }}" "${{ steps.get_version.outputs.date }}" > tag_text.txt
+          printf "Pre-built binaries for GCC %s.\n\nBuilt from git ref: %s\n" "${{ steps.get_version.outputs.gcc_version }}" "${{ steps.get_version.outputs.git_ref }}" > tag_text.txt
           cat tag_text.txt
+
+      - name: Create tarball of /opt/gcc
+        run: |
+          sudo tar -C /opt -cJf /tmp/${{ steps.get_version.outputs.archive_name }} gcc
+          ls -lh /tmp/${{ steps.get_version.outputs.archive_name }}
 
       # Checkout the repository where you want to create the tag (as original workflow did)
       - uses: actions/checkout@v4
@@ -137,19 +156,19 @@ jobs:
           tag_name: "${{ steps.get_version.outputs.build_tag }}"
           path: "repo"
 
-      - name: Create/Update GitHub Release (tag+name include GCC version)
+      - name: Create/Update GitHub Release (tag+name include GCC version and git ref)
         uses: softprops/action-gh-release@v0.1.15
         with:
           body_path: tag_text.txt
           tag_name: "${{ steps.get_version.outputs.build_tag }}"
           target_commitish: ${{ github.sha }}
           prerelease: true
-          # set release name to include the GCC version and date
-          name: "Nightly build - GCC ${{ steps.get_version.outputs.gcc_version }} (${ { steps.get_version.outputs.date } })"
+          # set release name to include the GCC version and git ref (no date)
+          name: "Nightly build - GCC ${{ steps.get_version.outputs.gcc_version }} (${ { steps.get_version.outputs.git_ref } })"
 
       - name: Update nightly release (upload artifact)
         uses: pyTooling/Actions/releaser/composite@v4.2.2
         with:
           tag: "${{ steps.get_version.outputs.build_tag }}"
           token: ${{ secrets.GITHUB_TOKEN }}
-          files: "/tmp/gcc-16-opt.tar.xz"
+          files: "/tmp/${{ steps.get_version.outputs.archive_name }}"
